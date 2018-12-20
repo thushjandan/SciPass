@@ -29,6 +29,9 @@ from ryu.ofproto import ofproto_v1_0
 from ryu.ofproto import ofproto_v1_3
 from ryu.lib import hub
 from ryu.lib import dpid as dpid_lib
+from ryu.lib.packet import packet
+from ryu.lib.packet import packet_base
+from ryu.lib.packet import arp
 from ryu.app.wsgi import ControllerBase, WSGIApplication, route
 from webob import Response
 import json
@@ -172,7 +175,7 @@ class Ryu(app_manager.RyuApp):
         self.stats_thread = hub.spawn(self._stats_loop)
         self.balance_thread = hub.spawn(self._balance_loop)
         
-        self.ports = defaultdict(dict);
+        self.ports = defaultdict(dict)
         self.prefix_bytes = defaultdict(lambda: defaultdict(dict))
         self.lastStatsTime = {}
         self.flowmods = {}
@@ -354,6 +357,10 @@ class Ryu(app_manager.RyuApp):
             header['in_port'] = int(header['phys_port'])
             del header['phys_port']
 
+        if (header.has_key('eth_type')):
+            if (header['eth_type'] == 2054):
+                obj['eth_type'] = ether.ETH_TYPE_ARP
+
         if(header.has_key('nw_src')):
             if(header['nw_src'].version == 4):
                 obj['ipv4_src'] = (str(header['nw_src'].ip), str(header['nw_src'].netmask))
@@ -453,9 +460,18 @@ class Ryu(app_manager.RyuApp):
         of_actions = []
         for action in actions:
             if(action['type'] == "output"):
-                of_actions.append(parser.OFPActionOutput(port     = int(action['port']),
-                                                         max_len  = 0
-                                                         ))
+                if action['port'] == "NORMAL":
+                    of_actions.append(parser.OFPActionOutput(port=ofp.OFPP_NORMAL, max_len=0))
+                else:
+                    of_actions.append(parser.OFPActionOutput(port     = int(action['port']),
+                                                             max_len  = 0
+                                                             )) 
+            if action['type'] == "PUSH_VLAN":
+                of_actions.append(parser.OFPActionPushVlan())
+                of_actions.append(parser.OFPActionSetField(vlan_vid=int(action['vlan_vid'])))
+            if action['type'] == 'SET_FIELD':
+                action_set_field = { action['field']: action['value'] }
+                of_actions.append(parser.OFPActionSetField(**action_set_field))
 
         if header.has_key('dl_type'):
             del header["dl_type"]
@@ -1210,4 +1226,23 @@ class Ryu(app_manager.RyuApp):
         #                     ev.msg.datapath.id, stat.port_no,
         #                     stat.rx_packets, stat.rx_bytes, stat.rx_errors,
         #                     stat.tx_packets, stat.tx_bytes, stat.tx_errors)
+    # Update ARP table in SciPass
+    @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
+    def _packetin_arp(self, ev):
+        ARP = arp.arp.__name__
+        msg = ev.msg
+        pkt = packet.Packet(msg.data)
+        header_list = dict(
+            (p.protocol_name, p) 
+            for p in pkt.protocols
+            if isinstance(p, packet_base.PacketBase)
+        )
+        # If packet is a ARP packet, then process it.
+        if ARP in header_list:
+            # Process only ARP replies
+            if header_list[ARP].opcode == arp.ARP_REPLY:
+                # ARP packet handling.
+                src_mac = header_list[ARP].src_mac
+                src_ip = header_list[ARP].src_ip
+                self.api.updateMacAddress(src_mac, src_ip)
 

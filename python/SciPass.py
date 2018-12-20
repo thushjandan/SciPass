@@ -60,6 +60,7 @@ class SciPass:
     self.idleTimeouts = []
     self.hardTimeouts = []
     self.switches     = []
+    self.macAddressTable = {}
     self.flowCount = 0
     self.switchForwardingChangeHandlers = []
     self._validateConfig(self.configFile, self.schemaFile)
@@ -81,10 +82,13 @@ class SciPass:
     #build our prefixes
     src_prefix = ipaddr.IPv4Network(obj['nw_src'])
     dst_prefix = ipaddr.IPv4Network(obj['nw_dst'])
+
+    switch_info = self.getSwitches()
     
     #find the switch, domain, lan, wan ports
     for dpid in self.config:
       for name in self.config[dpid]:
+        [switch_info_dpid] = filter(lambda x: x['dpid'] == dpid, switch_info)
         
         used_wan_ports = []
         wan_action = []
@@ -106,8 +110,8 @@ class SciPass:
 
         #step one figure out the actions :)
         #lets just calculate the wan ports involved here
-        if len(self.config[dpid][name]['ports']['wan']) > 1:
-          for port in self.config[dpid][name]['ports']['wan']:
+        if len(self.config[dpid][name]['ports']['to_wan_bypass']) > 1:
+          for port in self.config[dpid][name]['ports']['to_wan_bypass']:
             for prefix in port['prefixes']:
               if prefix['prefix'].Contains( src_prefix ):
                 used_wan_ports.append(port['port_id'])
@@ -118,18 +122,39 @@ class SciPass:
                   wan_action.append({"type": "output",
                                      "port": port['port_id']})
         #if you only have 1 wan we don't require prefixes
-        elif len(self.config[dpid][name]['ports']['wan']) == 1:
-          used_wan_ports.append(self.config[dpid][name]['ports']['wan'][0]['port_id'])
+        elif len(self.config[dpid][name]['ports']['to_wan_bypass']) == 1:
+          [sw_src_mac] = filter(
+            lambda switch: switch['port_no'] == int(self.config[dpid][name]['ports']['to_wan_bypass'][0]['port_id']),
+            switch_info_dpid['ports']
+            )
+
+          used_wan_ports.append(self.config[dpid][name]['ports']['to_wan_bypass'][0]['port_id'])
+          wan_action.append({"type": "PUSH_VLAN", "vlan_vid": 10})
+          wan_action.append({"type": "SET_FIELD", "field": "eth_src", "value": sw_src_mac['mac_addr']})
+          wan_action.append({"type": "SET_FIELD", "field": "eth_dst", "value": "34:f8:e7:3a:ab:a0"})
+
           wan_action.append({"type": "output",
-                             "port": self.config[dpid][name]['ports']['wan'][0]['port_id']})
+                             "port": self.config[dpid][name]['ports']['to_wan_bypass'][0]['port_id']})
 
         #lets just calculate the wan ports involved here
-        for port in self.config[dpid][name]['ports']['lan']:
+        for port in self.config[dpid][name]['ports']['to_lan_bypass']:
           for prefix in port['prefixes']:
             if prefix['prefix'].Contains( src_prefix ):
+              [sw_src_mac] = filter(
+                lambda switch: switch['port_no'] == int(port['port_id']),
+                switch_info_dpid['ports']
+                )
+              lan_action.append({"type": "SET_FIELD", "field": "eth_src", "value": sw_src_mac['mac_addr']})
+              lan_action.append({"type": "SET_FIELD", "field": "eth_dst", "value": "00:24:38:9a:64:61"})
               lan_action.append({"type": "output",
                                  "port": port['port_id']})
             if prefix['prefix'].Contains( dst_prefix ):
+              [sw_src_mac] = filter(
+                lambda switch: switch['port_no'] == int(port['port_id']),
+                switch_info_dpid['ports']
+                )
+              lan_action.append({"type": "SET_FIELD", "field": "eth_src", "value": sw_src_mac['mac_addr']})
+              lan_action.append({"type": "SET_FIELD", "field": "eth_dst", "value": "00:24:38:9a:64:61"})
               lan_action.append({"type": "output",
                                  "port": port['port_id']})
 
@@ -165,11 +190,21 @@ class SciPass:
               for wan in used_wan_ports:
                 header = self._build_header(obj,True)
                 header['phys_port'] = int(wan)
+                [sw_src_mac] = filter(
+                  lambda switch: switch['port_no'] == int(port['port_id']),
+                  switch_info_dpid['ports']
+                  )
+                bypass_to_lan_action = [
+                  {"type": "SET_FIELD", "field": "eth_src", "value": sw_src_mac['mac_addr']},
+                  {"type": "SET_FIELD", "field": "eth_dst", "value": "00:0c:29:c3:ef:71"},
+                  {"type": "output", "port": port['port_id']},
+                ]
+
                 match = self.stringify(header)
                 status = self.fireForwardingStateChangeHandlers( dpid         = dpid,
                                                                  domain       = name,
                                                                  header       = header,
-                                                                 actions      = lan_action,
+                                                                 actions      = bypass_to_lan_action,,
                                                                  command      = "ADD",
                                                                  idle_timeout = idle_timeout,
                                                                  hard_timeout = 0,
@@ -182,14 +217,22 @@ class SciPass:
                   return results
                 else:
                   flow = { 'dpid' : dpid, 'domain' : name,'header': match,
-                           'actions' : lan_action,'priority' : priority }
+                           'actions' : bypass_to_lan_action,'priority' : priority }
                   flows.append(flow)
                   self.whiteList.append(flow)
-                
-            #check the other dir          
-            if(prefix['prefix'].Contains( dst_prefix )):
-              header = self._build_header(obj,True)
+
+            for port in self.config[dpid][name]['ports']['to_lan_bypass']:
+              header = self._build_header(obj, False)
               header['phys_port'] = int(port['port_id'])
+              [sw_src_mac] = filter(
+                lambda switch: switch['port_no'] == int(self.config[dpid][name]['ports']['wan'][0]['port_id']),
+                switch_info_dpid['ports']
+                )
+              wan_action = [
+                {"type": "SET_FIELD", "field": "eth_src", "value": sw_src_mac['mac_addr']},
+                {"type": "SET_FIELD", "field": "eth_dst", "value": "00:50:56:95:5f:0d"},
+                {"type": "output", "port": self.config[dpid][name]['ports']['wan'][0]['port_id']}
+              ]
               match = self.stringify(header)
               status = self.fireForwardingStateChangeHandlers( dpid         = dpid,
                                                                domain       = name,
@@ -211,9 +254,9 @@ class SciPass:
                 self.whiteList.append(flow)
 
               #now do the wan side (there might be multiple)
-              for wan in used_wan_ports:
-                header = self._build_header(obj,False)
-                header['phys_port'] = int(wan)
+              for wan in self.config[dpid][name]['ports']['wan']:
+                header = self._build_header(obj, True)
+                header['phys_port'] = int(wan['port_id'])
                 match = self.stringify(header)
                 status = self.fireForwardingStateChangeHandlers( dpid         = dpid,
                                                                  domain       = name,
@@ -571,6 +614,8 @@ class SciPass:
         config[dpid][name]['ports']['wan'] = []
         config[dpid][name]['ports']['fw_lan'] = []
         config[dpid][name]['ports']['fw_wan'] = []
+        config[dpid][name]['ports']['to_lan_bypass'] = []
+        config[dpid][name]['ports']['to_wan_bypass'] = []
         state = None
         if self.readState:
           prevState = "/var/run/" +  dpid +  name + ".json"
@@ -744,109 +789,104 @@ class SciPass:
 
     fw_lan_outputs = []
 
-    for in_port in ports['lan']:
-      header = {"phys_port":   int(in_port['port_id']),
+    if len(ports['lan']) > 0:
+      for in_port in ports['lan']:
+        header = {"phys_port":   int(in_port['port_id']),
+                  'dl_type': None}
+        
+        actions = []
+        #output to FW
+        actions.append({"type": "output",
+                        "port": int(ports['fw_lan'][0]['port_id'])})
+
+        fw_lan_outputs.append({"type": "output",
+                              "port": int(in_port['port_id'])})
+
+        for prefix in in_port['prefixes']:
+          self.config[dpid][domain_name]['balancer'].addPrefix(prefix['prefix'])
+          prefixes.append(prefix['prefix'])
+          #specific prefix forwarding rules
+          #FW LAN to specific LAN PORT
+          header = {}
+          header = {"phys_port": int(ports['fw_lan'][0]['port_id']),
+                    "nw_dst": prefix['prefix']}        
+          actions = []
+          actions.append({"type": "output",
+                          "port": "NORMAL"})
+          
+          self.fireForwardingStateChangeHandlers( dpid         = dpid,
+                                                  domain     = domain_name,
+                                                  header       = header,
+                                                  actions      = actions,
+                                                  command      = "ADD",
+                                                  idle_timeout = 0,
+                                                  hard_timeout = 0,
+                                                  priority     = int(priority))
+          
+          #SPECIFIC LAN -> FW LAN port
+          header = {}
+          header = {"phys_port": int(in_port['port_id']),
+                    "nw_src": prefix['prefix']}
+
+          actions = []
+          actions.append({"type": "output",
+                          "port": "NORMAL"})
+          
+          self.fireForwardingStateChangeHandlers( dpid         = dpid,
+                                                  domain       = domain_name,
+                                                  header       = header,
+                                                  actions      = actions,
+                                                  command      = "ADD",
+                                                  idle_timeout = 0,
+                                                  hard_timeout = 0,
+                                                  priority     = int(priority))
+
+    if len(ports['fw_lan']) > 0:
+      #FW LAN to ALL INPUT PORTS
+      header = {"phys_port": int(ports['fw_lan'][0]['port_id']),
                 'dl_type': None}
       
-      actions = []
-      #output to FW
-      actions.append({"type": "output",
-                      "port": int(ports['fw_lan'][0]['port_id'])})
-
-      fw_lan_outputs.append({"type": "output",
-                             "port": int(in_port['port_id'])})
       self.fireForwardingStateChangeHandlers( dpid         = dpid,
-                                              domain     = domain_name,
+                                              domain       = domain_name,
+                                              header       = header,
+                                              actions      = fw_lan_outputs,
+                                              command      = "ADD",
+                                              idle_timeout = 0,
+                                              hard_timeout = 0,
+                                              priority     = int(priority / 3))
+
+    if len(ports['fw_wan']) > 0:
+      #FW WAN -> WAN
+      header = {"phys_port": int(ports['fw_wan'][0]['port_id']),
+                'dl_type': None}
+      actions = []
+      actions.append({"type": "output",
+                      "port": int(ports['wan'][0]['port_id'])})
+      self.logger.debug("FW WAN -> WAN: ")
+      self.fireForwardingStateChangeHandlers( dpid         = dpid,
+                                              domain       = domain_name,
                                               header       = header,
                                               actions      = actions,
                                               command      = "ADD",
                                               idle_timeout = 0,
                                               hard_timeout = 0,
-                                              priority     = int(priority / 2))
+                                              priority     = int(priority))
 
-      for prefix in in_port['prefixes']:
-        self.config[dpid][domain_name]['balancer'].addPrefix(prefix['prefix'])
-        prefixes.append(prefix['prefix'])
-        #specific prefix forwarding rules
-        #FW LAN to specific LAN PORT
-        header = {}
-        header = {"phys_port": int(ports['fw_lan'][0]['port_id']),
-                  "nw_dst": prefix['prefix']}        
-        actions = []
-        actions.append({"type": "output",
-                        "port": int(in_port['port_id'])})
-        
-        self.fireForwardingStateChangeHandlers( dpid         = dpid,
-                                                domain     = domain_name,
-                                                header       = header,
-                                                actions      = actions,
-                                                command      = "ADD",
-                                                idle_timeout = 0,
-                                                hard_timeout = 0,
-                                                priority     = int(priority))
-        
-        #SPECIFIC LAN -> FW LAN port
-        header = {}
-        header = {"phys_port": int(in_port['port_id']),
-                  "nw_src": prefix['prefix']}
-
-        actions = []
-        actions.append({"type": "output",
-                        "port": int(ports['fw_lan'][0]['port_id'])})
-        
-        self.fireForwardingStateChangeHandlers( dpid         = dpid,
-                                                domain       = domain_name,
-                                                header       = header,
-                                                actions      = actions,
-                                                command      = "ADD",
-                                                idle_timeout = 0,
-                                                hard_timeout = 0,
-                                                priority     = int(priority))
-
-    #FW LAN to ALL INPUT PORTS
-    header = {"phys_port": int(ports['fw_lan'][0]['port_id']),
-              'dl_type': None}
-    
-    self.fireForwardingStateChangeHandlers( dpid         = dpid,
-                                            domain       = domain_name,
-                                            header       = header,
-                                            actions      = fw_lan_outputs,
-                                            command      = "ADD",
-                                            idle_timeout = 0,
-                                            hard_timeout = 0,
-                                            priority     = int(priority / 3))
-
-    #FW WAN -> WAN
-    header = {"phys_port": int(ports['fw_wan'][0]['port_id']),
-              'dl_type': None}
-    actions = []
-    actions.append({"type": "output",
-                    "port": int(ports['wan'][0]['port_id'])})
-    self.logger.debug("FW WAN -> WAN: ")
-    self.fireForwardingStateChangeHandlers( dpid         = dpid,
-                                            domain       = domain_name,
-                                            header       = header,
-                                            actions      = actions,
-                                            command      = "ADD",
-                                            idle_timeout = 0,
-                                            hard_timeout = 0,
-                                            priority     = int(priority))
-
-    #WAN -> FW WAN
-    header = {"phys_port": int(ports['wan'][0]['port_id']),
-              'dl_type': None}
-    actions = []
-    actions.append({"type": "output",
-                    "port": int(ports['fw_wan'][0]['port_id'])})
-    self.logger.debug("WAN -> FW WAN")
-    self.fireForwardingStateChangeHandlers( dpid         = dpid,
-                                            domain       = domain_name,
-                                            header       = header,
-                                            actions      = actions,
-                                            command      = "ADD",
-                                            idle_timeout = 0,
-                                            hard_timeout = 0,
-                                            priority     = int(priority))
+      #WAN -> FW WAN
+      header = {"phys_port": int(ports['wan'][0]['port_id']),
+                'dl_type': None}
+      actions = []
+      actions.append({"type": "output",
+                      "port": int(ports['fw_wan'][0]['port_id'])})
+      self.logger.debug("WAN -> FW WAN")
+      self.fireForwardingStateChangeHandlers( dpid         = dpid,
+                                              domain       = domain_name,
+                                              header       = header,
+                                              actions      = actions,
+                                              command      = "ADD",
+                                              idle_timeout = 0,
+                                              hard_timeout = 0,
+                                              priority     = int(priority))
 
     #ok now that we have that done... start balancing!!!
     self.logger.info("Distributing Prefixes!")
@@ -989,7 +1029,7 @@ class SciPass:
           #append the FW or other destination
             if(ports.has_key('fw_lan') and len(ports['fw_lan']) > 0):
               actions.append({"type": "output",
-                              "port": int(ports['fw_lan'][0]['port_id'])})
+                              "port": "NORMAL"})
             else:
               actions.append({"type": "output",
                               "port": int(ports['wan'][0]['port_id'])})
@@ -1014,7 +1054,7 @@ class SciPass:
           header = {}
           if(self.config[dpid][domain_name]['mode'] == "SciDMZ" or self.config[dpid][domain_name]['mode'] == "InlineIDS"):
             header = {"nw_dst": prefix,
-                      "phys_port": int(ports['wan'][0]['port_id'])}
+                      "phys_port": int(ports['fw_lan'][0]['port_id'])}
           else:
             header = {"nw_dst": prefix,
                       "phys_port": int(in_port['port_id'])}
@@ -1029,7 +1069,7 @@ class SciPass:
               #append the FW or other destination
             if(ports.has_key('fw_wan') and len(ports['fw_wan']) > 0):
               actions.append({"type": "output",
-                              "port": int(ports['fw_wan'][0]['port_id'])})
+                              "port": "NORMAL"})
             else:
               actions.append({"type": "output",
                               "port": int(ports['wan'][0]['port_id'])})
@@ -1457,3 +1497,7 @@ class SciPass:
                                                   priority     = flow['priority'])
           
           self.idleTimeouts.remove(flow)
+
+# Update internal MAC address table
+def updateMacAddress(self, mac, ip):
+  self.macAddressTable[mac] = ip
